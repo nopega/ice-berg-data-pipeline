@@ -151,7 +151,11 @@ def main() -> None:
             if batch.num_rows == 0:
                 continue
 
-            df = spark.createDataFrame(batch.to_pandas())
+            # Arrow straight into Spark. batch.to_pandas() would work too, but
+            # it needs pandas in the image and converts Arrow -> pandas ->
+            # Arrow again, holding two copies of the batch at the peak. Spark
+            # 4.0 accepts a pyarrow.Table directly and only requires pyarrow.
+            df = spark.createDataFrame(pa.Table.from_batches([batch]))
 
             # The metadata that makes bronze auditable. trip_date is set from
             # the ARGUMENT, not derived from the data -- the filter above has
