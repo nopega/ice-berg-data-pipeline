@@ -45,6 +45,7 @@ import os
 import sys
 import tempfile
 
+import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
@@ -123,6 +124,14 @@ def main() -> None:
                 f"schema; columns are: {pf.schema_arrow.names}"
             )
 
+        # pa.scalar, NOT pc.scalar. pc.scalar builds an Expression for the
+        # dataset filter DSL, which compute kernels reject outright. Casting to
+        # the column's own type keeps the comparison from silently failing on a
+        # unit mismatch if TLC ever republishes with nanosecond timestamps.
+        pickup_type = pf.schema_arrow.field(PICKUP_COL).type
+        lo_scalar = pa.scalar(lo).cast(pickup_type)
+        hi_scalar = pa.scalar(hi).cast(pickup_type)
+
         ingested_at = dt.datetime.now(dt.timezone.utc)
         scanned = 0
         kept = 0
@@ -135,8 +144,8 @@ def main() -> None:
             # is the difference between shipping 3,000,000 rows through py4j
             # and shipping 100,000.
             mask = pc.and_(
-                pc.greater_equal(batch.column(PICKUP_COL), pc.scalar(lo)),
-                pc.less(batch.column(PICKUP_COL), pc.scalar(hi)),
+                pc.greater_equal(batch.column(PICKUP_COL), lo_scalar),
+                pc.less(batch.column(PICKUP_COL), hi_scalar),
             )
             batch = batch.filter(mask)
             if batch.num_rows == 0:
