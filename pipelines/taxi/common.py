@@ -85,9 +85,10 @@ def build_spark(app_name: str) -> SparkSession:
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
-        # Arrow makes the driver-side handoff of Pandas batches into Spark
-        # roughly an order of magnitude faster. Without it the bronze task
-        # spends most of its time serialising rows one at a time through py4j.
+        # Bronze hands Spark a pyarrow.Table directly. That path needs pyarrow
+        # and NOT pandas, which is why the image does not carry pandas; the
+        # alternative, batch.to_pandas(), converts Arrow -> pandas -> Arrow and
+        # holds two copies of the batch at the peak.
         .config("spark.sql.execution.arrow.pyspark.enabled", "true")
         .getOrCreate()
     )

@@ -33,29 +33,39 @@ from common import (  # noqa: E402
     replace_day,
 )
 
-# Rules, in the order they are applied. Each is (name, condition-to-KEEP).
-#
-# The bounds are not arbitrary:
-#   - a pickup outside the partition's own day is a corrupt timestamp; TLC
-#     files routinely contain a handful of rows dated 2001 or 2098
-#   - distance and fare of exactly 0 are cancelled or voided trips
-#   - a negative fare is a refund posted as a trip
-#   - over 500 miles inside NYC is a meter fault
-#   - a duration over 24h or under 1 minute is a meter left running or a
-#     mis-punch, not a journey
-RULES = [
-    ("pickup timestamp missing", F.col("tpep_pickup_datetime").isNotNull()),
-    ("dropoff timestamp missing", F.col("tpep_dropoff_datetime").isNotNull()),
-    ("dropoff before pickup", F.col("tpep_dropoff_datetime") > F.col("tpep_pickup_datetime")),
-    ("pickup outside the partition day", F.to_date("tpep_pickup_datetime") == F.col(PARTITION_COL)),
-    ("duration under 1 minute", F.col("trip_duration_min") >= 1),
-    ("duration over 24 hours", F.col("trip_duration_min") <= 1440),
-    ("distance not positive", F.col("trip_distance") > 0),
-    ("distance over 500 miles", F.col("trip_distance") <= 500),
-    ("fare not positive", F.col("fare_amount") > 0),
-    ("total below fare", F.col("total_amount") >= F.col("fare_amount")),
-    ("negative tip", F.col("tip_amount") >= 0),
-]
+def quality_rules():
+    """
+    The rules, as (name, condition-to-KEEP) pairs.
+
+    A FUNCTION, not a module-level list. F.col() builds a Column through the
+    JVM gateway and asserts that a SparkContext is already active; evaluating
+    these at import time -- which is exactly when Spark imports the main file,
+    before build_spark() has run -- raises a bare AssertionError with no
+    message. Anything that constructs a Column has to be called after the
+    session exists.
+
+    The bounds are not arbitrary:
+      - a pickup outside the partition's own day is a corrupt timestamp; TLC
+        files routinely contain a handful of rows dated 2001 or 2098
+      - distance and fare of exactly 0 are cancelled or voided trips
+      - a negative fare is a refund posted as a trip
+      - over 500 miles inside NYC is a meter fault
+      - a duration over 24h or under 1 minute is a meter left running or a
+        mis-punch, not a journey
+    """
+    return [
+        ("pickup timestamp missing", F.col("tpep_pickup_datetime").isNotNull()),
+        ("dropoff timestamp missing", F.col("tpep_dropoff_datetime").isNotNull()),
+        ("dropoff before pickup", F.col("tpep_dropoff_datetime") > F.col("tpep_pickup_datetime")),
+        ("pickup outside the partition day", F.to_date("tpep_pickup_datetime") == F.col(PARTITION_COL)),
+        ("duration under 1 minute", F.col("trip_duration_min") >= 1),
+        ("duration over 24 hours", F.col("trip_duration_min") <= 1440),
+        ("distance not positive", F.col("trip_distance") > 0),
+        ("distance over 500 miles", F.col("trip_distance") <= 500),
+        ("fare not positive", F.col("fare_amount") > 0),
+        ("total below fare", F.col("total_amount") >= F.col("fare_amount")),
+        ("negative tip", F.col("tip_amount") >= 0),
+    ]
 
 
 def main() -> None:
@@ -85,19 +95,46 @@ def main() -> None:
     )
 
     print("[3/5] Applying quality rules...")
-    kept = df
-    for name, keep in RULES:
-        before = kept.count()
-        kept = kept.where(keep)
-        removed = before - kept.count()
+    rules = quality_rules()
+
+    # A null condition means "unknown", which SQL treats as neither true nor
+    # false. coalesce(..., False) makes a row with a null in the compared
+    # column fail the rule rather than slip through a NOT.
+    keeps = [(name, F.coalesce(cond, F.lit(False))) for name, cond in rules]
+    survives_all = keeps[0][1]
+    for _, k in keeps[1:]:
+        survives_all = survives_all & k
+
+    # One pass, not one pass per rule. The obvious loop -- filter, count,
+    # filter, count -- costs two full scans per rule, and every count()
+    # re-executes the whole chain from the Iceberg read. Eleven rules that way
+    # is twenty-two scans of the day to print eleven numbers.
+    #
+    # The trade-off: these counts are INDEPENDENT, not sequential. Each says
+    # "how many rows fail this rule", so a row failing three rules is counted
+    # three times and the numbers do not sum to the total removed. That is the
+    # more useful question anyway -- a sequential count makes a rule's apparent
+    # impact depend on where it sits in the list.
+    probe = df.select(
+        *[
+            F.sum(F.when(k, 0).otherwise(1)).alias(f"rule_{i}")
+            for i, (_, k) in enumerate(keeps)
+        ],
+        F.sum(F.when(survives_all, 1).otherwise(0)).alias("survivors"),
+    ).collect()[0]
+
+    for i, (name, _) in enumerate(keeps):
+        removed = int(probe[f"rule_{i}"] or 0)
         pct = (removed / raw_count * 100) if raw_count else 0
         flag = "  <-- unusually high" if pct > 10 else ""
-        print(f"      {name:<34} removed {removed:>8,} ({pct:5.2f}%){flag}")
+        print(f"      {name:<34} fails {removed:>8,} ({pct:5.2f}%){flag}")
+
+    kept = df.where(survives_all)
 
     # Dedupe AFTER filtering: a duplicate of a row that was going to be dropped
     # anyway is not worth the shuffle. Two trips can legitimately share a
     # pickup time and location, so the key includes the fare and the dropoff.
-    before = kept.count()
+    before = int(probe["survivors"] or 0)
     kept = kept.dropDuplicates(
         [
             "VendorID",
@@ -147,7 +184,10 @@ def main() -> None:
         "_run_id",
     )
 
-    surviving = final.count()
+    # `after` already counted this set; select() only projects columns and
+    # cannot change the row count, so counting again would be a second scan
+    # for a number we hold.
+    surviving = after
     pct = surviving / raw_count * 100
     print(f"      {surviving:,} of {raw_count:,} rows survive ({pct:.1f}%)")
     if pct < 50:
