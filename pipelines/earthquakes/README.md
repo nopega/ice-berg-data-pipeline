@@ -21,30 +21,43 @@ pipeline captures.
 
 ## Flow
 
+In the order things run when the DAG is triggered. Each box in a task is one
+of the `[n/m]` steps the job prints to the Airflow log.
+
 ```mermaid
 flowchart LR
-    API["USGS Event API<br/>updatedafter = watermark − 1h"]
+    TR(["Airflow: usgs_earthquakes<br/>daily 10:30 Asia/Bangkok, or manual trigger"])
 
-    subgraph B["bronze.transactional.earthquakes"]
-        CL[("event_changelog<br/>every version<br/>append-only")]
-    end
-    subgraph S["silver.derived.earthquakes"]
-        H[("event_history<br/>SCD Type 2")]
-        C[("event_current<br/>SCD Type 1")]
-    end
-    subgraph G["gold.aggregate.earthquakes"]
-        D[("daily_summary<br/>day × region")]
+    subgraph T1["Task 1 · bronze_cdc → bronze_ingest.py"]
+        direction TB
+        B0["[0/3] governance check<br/>try to read bronze.transactional.taxi_trip<br/>must get 403, otherwise fail the run"]
+        B1["[1/3] watermark<br/>max(updated) in event_changelog<br/>(first run: last 3 days · or param since)"]
+        B2["[2/3] fetch<br/>USGS API: updatedafter = watermark − 1h<br/>20 000 events per page"]
+        B3[("[3/3] MERGE → event_changelog<br/>ON (event_id, updated)<br/>insert new versions only")]
+        B0 --> B1 --> B2 --> B3
     end
 
-    GOV{{"governance check<br/>can this principal read<br/>another pipeline's table?"}}
+    subgraph T2["Task 2 · silver_scd → silver_scd.py"]
+        direction TB
+        S1["[1/4] new versions<br/>changelog rows newer than max(updated) in event_current<br/>+ quality rules, counted"]
+        S2[("[2/4] SCD Type 2 → event_history<br/>hash_diff on tracked columns<br/>close old row, insert new state")]
+        S3[("[3/4] SCD Type 1 → event_current<br/>latest version per event, overwrite")]
+        S4["[4/4] print totals"]
+        S1 --> S2 --> S3 --> S4
+    end
 
-    GOV -- "403: OK, continue" --> API
-    API -- "bronze_ingest.py<br/>MERGE on (event_id, updated)" --> CL
-    CL -- "silver_scd.py<br/>versions newer than event_current" --> H
-    CL --> C
-    H -- "gold_daily.py<br/>last 35 event days" --> D
-    C --> D
-    D --> T["Trino → BI"]
+    subgraph T3["Task 3 · gold_daily → gold_daily.py"]
+        direction TB
+        G1["[1/3] read event_current + event_history<br/>last 35 event days"]
+        G2[("[2/3] overwrite partitions → daily_summary<br/>per event day × region")]
+        G3["[3/3] print the last 7 days"]
+        G1 --> G2 --> G3
+    end
+
+    TR --> B0
+    B3 --> S1
+    S4 --> G1
+    G3 --> BI(["Trino → BI"])
 ```
 
 Three Airflow tasks, each its own SparkApplication:
