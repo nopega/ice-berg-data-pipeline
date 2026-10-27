@@ -22,9 +22,14 @@ from pyspark.sql import SparkSession
 
 CATALOG = "data_platform"
 
-BRONZE = f"{CATALOG}.bronze.transactional.taxi_trip"
-SILVER = f"{CATALOG}.silver.derived.taxi_trip_cleaned"
-GOLD = f"{CATALOG}.gold.aggregate.taxi_daily_zone_revenue"
+# medallion . category . domain . table (VPN_DATA_PLATFORM/docs/DATA_TIER.md).
+# The domain level, `taxi`, is what access control binds to: Polaris principal
+# pl_taxi is granted these three namespaces and nothing else
+# (bootstrap/pipeline_principal.sh taxi).
+DOMAIN = "taxi"
+BRONZE = f"{CATALOG}.bronze.transactional.{DOMAIN}.taxi_trip"
+SILVER = f"{CATALOG}.silver.derived.{DOMAIN}.taxi_trip_cleaned"
+GOLD = f"{CATALOG}.gold.aggregate.{DOMAIN}.taxi_daily_zone_revenue"
 
 # No backticks around the namespace. Spark's multipart identifiers already
 # express nesting; quoting the dotted string asks Polaris for a single
@@ -65,7 +70,7 @@ def build_spark(app_name: str) -> SparkSession:
 
     Every line here is load-bearing:
       type=rest        -> speak the Iceberg REST protocol to Polaris
-      credential       -> the `etl` principal; Polaris decides what S3
+      credential       -> the `pl_taxi` principal; Polaris decides what S3
                           credentials to vend from ITS privileges, so this is
                           where the platform's access control actually binds
       io-impl=S3FileIO -> Iceberg's own S3 client rather than Hadoop S3A
