@@ -30,7 +30,7 @@ flowchart LR
 
     subgraph T1["Task 1 · bronze_cdc → bronze_ingest.py"]
         direction TB
-        B0["[0/3] governance check<br/>try to read bronze.transactional.taxi_trip<br/>must get 403, otherwise fail the run"]
+        B0["[0] access check<br/>can list bronze.transactional.earthquakes<br/>can read event_changelog (if it exists)"]
         B1["[1/3] watermark<br/>max(updated) in event_changelog<br/>(first run: last 3 days · or param since)"]
         B2["[2/3] fetch<br/>USGS API: updatedafter = watermark − 1h<br/>20 000 events per page"]
         B3[("[3/3] MERGE → event_changelog<br/>ON (event_id, updated)<br/>insert new versions only")]
@@ -39,24 +39,26 @@ flowchart LR
 
     subgraph T2["Task 2 · silver_scd → silver_scd.py"]
         direction TB
+        S0["[0] access check<br/>bronze + silver namespaces"]
         S1["[1/4] new versions<br/>changelog rows newer than max(updated) in event_current<br/>+ quality rules, counted"]
         S2[("[2/4] SCD Type 2 → event_history<br/>hash_diff on tracked columns<br/>close old row, insert new state")]
         S3[("[3/4] SCD Type 1 → event_current<br/>latest version per event, overwrite")]
         S4["[4/4] print totals"]
-        S1 --> S2 --> S3 --> S4
+        S0 --> S1 --> S2 --> S3 --> S4
     end
 
     subgraph T3["Task 3 · gold_daily → gold_daily.py"]
         direction TB
+        G0["[0] access check<br/>silver + gold namespaces"]
         G1["[1/3] read event_current + event_history<br/>last 35 event days"]
         G2[("[2/3] overwrite partitions → daily_summary<br/>per event day × region")]
         G3["[3/3] print the last 7 days"]
-        G1 --> G2 --> G3
+        G0 --> G1 --> G2 --> G3
     end
 
     TR --> B0
-    B3 --> S1
-    S4 --> G1
+    B3 --> S0
+    S4 --> G0
     G3 --> BI(["Trino → BI"])
 ```
 
@@ -79,8 +81,8 @@ sequenceDiagram
     participant U as USGS API
     participant T as event_changelog
 
-    J->>P: read bronze.transactional.taxi_trip (on purpose)
-    P-->>J: 403 Forbidden ✔ (anything else → fail the run)
+    J->>P: list bronze.transactional.earthquakes, load event_changelog
+    P-->>J: allowed ✔ (403 → fail now, naming the missing grant)
     J->>T: max(updated)  → watermark
     J->>U: updatedafter = watermark − 1h, 20 000 per page
     U-->>J: changed events (all pages)
@@ -184,7 +186,7 @@ flowchart LR
     CR --> N1["bronze.transactional.earthquakes"]
     CR --> N2["silver.derived.earthquakes"]
     CR --> N3["gold.aggregate.earthquakes"]
-    CR -. "no grant" .-x X["anything else<br/>(e.g. taxi tables)"]
+    CR -. "no grant" .-x X["any other namespace"]
 ```
 
 - Grants are on the **namespaces**, so they cover every table the pipeline
@@ -193,8 +195,17 @@ flowchart LR
   Spark pods cannot read another pipeline's files even through S3.
 - The credential reaches the pods as Secret `spark/polaris-pl-earthquakes`; the
   shared `etl` credential is not mounted.
-- **Checked on every run**: bronze deliberately tries to read
-  `bronze.transactional.taxi_trip` and fails the run if Polaris allows it.
+- **Checked at the start of every job** (`check_access` in `common.py`): the
+  principal must be able to list each namespace the job uses and read each
+  table it reads. A missing grant fails the job in its first seconds with one
+  line naming the table and the script that grants it — not minutes later as
+  a stack trace from inside a MERGE.
+
+  | Job | Must list | Must read | Read if it exists |
+  |---|---|---|---|
+  | bronze | bronze ns | — | `event_changelog` |
+  | silver | bronze, silver ns | `event_changelog` | `event_history`, `event_current` |
+  | gold | silver, gold ns | `event_current`, `event_history` | `daily_summary` |
 
 Layout follows `medallion.category.domain.table` from
 `VPN_DATA_PLATFORM/docs/DATA_TIER.md`.

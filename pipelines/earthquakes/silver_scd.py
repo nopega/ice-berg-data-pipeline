@@ -33,9 +33,11 @@ from common import (  # noqa: E402
     CHANGELOG,
     CURRENT,
     HISTORY,
+    NS_BRONZE,
+    NS_SILVER,
     TRACKED,
     build_spark,
-    fail,
+    check_access,
 )
 
 DATA_COLS = ["event_time", "mag", "mag_type", "place", "longitude", "latitude",
@@ -64,8 +66,8 @@ def quality(df):
 def main() -> None:
     spark = build_spark("earthquakes-silver")
 
-    if not spark.catalog.tableExists(CHANGELOG):
-        fail(f"{CHANGELOG} does not exist. The bronze task has not run.")
+    check_access(spark, namespaces=[NS_BRONZE, NS_SILVER],
+                 read=[CHANGELOG], read_if_exists=[HISTORY, CURRENT])
 
     hwm = None
     if spark.catalog.tableExists(CURRENT):

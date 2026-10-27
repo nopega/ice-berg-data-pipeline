@@ -24,16 +24,17 @@ from pyspark.sql import Window
 from pyspark.sql import functions as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import CURRENT, DAILY, HISTORY, build_spark, fail  # noqa: E402
+from common import (  # noqa: E402
+    CURRENT, DAILY, HISTORY, NS_GOLD, NS_SILVER, build_spark, check_access,
+)
 
 REBUILD_DAYS = 35
 
 
 def main() -> None:
     spark = build_spark("earthquakes-gold")
-    for t in (CURRENT, HISTORY):
-        if not spark.catalog.tableExists(t):
-            fail(f"{t} does not exist. The silver task has not run.")
+    check_access(spark, namespaces=[NS_SILVER, NS_GOLD],
+                 read=[CURRENT, HISTORY], read_if_exists=[DAILY])
 
     since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=REBUILD_DAYS)).date()
     print(f"[1/3] Rebuilding event days from {since}")

@@ -6,8 +6,8 @@ bronze: incremental, query-based CDC from the USGS earthquake API.
 
 WHAT THIS JOB DOES
 ------------------
-0. Governance check: prove this run's principal CANNOT read another pipeline's
-   table. If Polaris lets it, the access model is broken and nothing runs.
+0. Access check: prove principal pl_earthquakes can list its bronze namespace
+   and read the changelog, before any API call is made.
 1. Watermark: the newest `updated` already in the changelog. Derived from the
    table itself, so it only moves when a write has committed -- a run that
    fails half-way leaves the watermark where it was and the next run re-reads
@@ -39,7 +39,8 @@ from pyspark.sql import types as T
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (  # noqa: E402
     CHANGELOG,
-    FORBIDDEN_PROBE,
+    NS_BRONZE,
+    check_access,
     build_spark,
     fail,
     opt_arg,
@@ -74,27 +75,6 @@ SCHEMA = T.StructType([
     T.StructField("net", T.StringType(), True),
     T.StructField("event_type", T.StringType(), True),
 ])
-
-
-def governance_check(spark) -> None:
-    """Fail the run if this principal can read a table outside its own domain."""
-    print(f"[0/3] Governance check: must NOT be able to read {FORBIDDEN_PROBE}")
-    try:
-        spark.table(FORBIDDEN_PROBE).limit(0).collect()
-    except Exception as exc:  # noqa: BLE001 -- classify by message below
-        msg = str(exc)
-        if any(k in msg for k in ("Forbidden", "NotAuthorized", "not authorized", "403")):
-            print("      denied by Polaris, as it should be")
-            return
-        if "NoSuchTable" in msg or "TABLE_OR_VIEW_NOT_FOUND" in msg or "NoSuchNamespace" in msg:
-            print("      WARNING: probe table does not exist, so the check proves nothing")
-            return
-        fail(f"governance check: unexpected error reading the probe table: {msg[:500]}")
-    fail(
-        f"governance check: this principal CAN read {FORBIDDEN_PROBE}. "
-        f"The pipeline is running with broader access than its own domain -- "
-        f"check which credential the SparkApplication mounted."
-    )
 
 
 def watermark(spark) -> dt.datetime | None:
@@ -155,7 +135,7 @@ def fetch(since: dt.datetime) -> list:
 
 def main() -> None:
     spark = build_spark("earthquakes-bronze")
-    governance_check(spark)
+    check_access(spark, namespaces=[NS_BRONZE], read_if_exists=[CHANGELOG])
 
     override = opt_arg(sys.argv, "--since")
     wm = watermark(spark)

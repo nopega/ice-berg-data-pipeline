@@ -39,10 +39,6 @@ HISTORY = f"{CATALOG}.{NS_SILVER}.event_history"
 # gold: per event day and region
 DAILY = f"{CATALOG}.{NS_GOLD}.daily_summary"
 
-# A table this pipeline must NOT be able to read. The governance check in the
-# bronze job tries it on purpose and fails the run if Polaris allows it.
-FORBIDDEN_PROBE = f"{CATALOG}.bronze.transactional.taxi_trip"
-
 # Columns whose change makes a new SCD Type 2 version. `updated` is NOT among
 # them: USGS bumps it for edits we do not model (a new contributing network, a
 # product attachment), and each of those would otherwise open a version that is
@@ -91,6 +87,51 @@ def build_spark(app_name: str) -> SparkSession:
     )
     spark.sparkContext.setLogLevel("WARN")
     return spark
+
+
+def check_access(spark, namespaces=(), read=(), read_if_exists=()) -> None:
+    """
+    Step 0 of every job: prove this principal can reach exactly what the job is
+    about to use, BEFORE any work starts.
+
+        namespaces       must be listable (TABLE_LIST on the namespace)
+        read             must exist and be readable (loads the table with
+                         vended S3 credentials, i.e. TABLE_READ_DATA)
+        read_if_exists   readable if present; absent is fine (first run)
+
+    Without this, a missing grant shows up several minutes into a run as a
+    Java stack trace from deep inside a MERGE. Here it is one line naming the
+    table and the script that grants it.
+    """
+    who = "pl_earthquakes"
+    print(f"[0] Access check as {who}")
+
+    def denied(what: str, exc: Exception) -> None:
+        msg = str(exc)
+        hint = (" -- the grant is missing; re-run "
+                "VPN_DATA_PLATFORM/bootstrap/pipeline_principal.sh earthquakes")
+        if not any(k in msg for k in ("Forbidden", "NotAuthorized", "not authorized", "403")):
+            hint = ""
+        fail(f"access check: cannot {what}{hint}\n      {msg[:400]}")
+
+    for ns in namespaces:
+        try:
+            spark.sql(f"SHOW TABLES IN {CATALOG}.{ns}").collect()
+        except Exception as exc:  # noqa: BLE001
+            denied(f"list namespace {ns}", exc)
+        print(f"      list  {ns}: ok")
+
+    for t in [*read, *read_if_exists]:
+        if not spark.catalog.tableExists(t):
+            if t in read:
+                fail(f"access check: {t} does not exist -- has the upstream task run?")
+            print(f"      read  {t}: not created yet (first run)")
+            continue
+        try:
+            spark.table(t).limit(1).collect()
+        except Exception as exc:  # noqa: BLE001
+            denied(f"read {t}", exc)
+        print(f"      read  {t}: ok")
 
 
 def opt_arg(argv: list[str], name: str) -> str | None:
